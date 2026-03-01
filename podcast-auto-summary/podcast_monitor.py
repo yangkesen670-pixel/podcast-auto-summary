@@ -368,10 +368,11 @@ def send_email(episode, summary):
         return False
 
     log("正在寄送 Email...")
+    recipients = [r.strip() for r in EMAIL_RECIPIENT.split(",")]
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🎙️ 股癌摘要：{episode['title']}"
     msg["From"] = EMAIL_SENDER
-    msg["To"] = EMAIL_RECIPIENT
+    msg["To"] = ", ".join(recipients)
 
     text_body = f"""股癌 Podcast 摘要
 {'='*40}
@@ -403,7 +404,7 @@ def send_email(episode, summary):
     try:
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
+            server.sendmail(EMAIL_SENDER, recipients, msg.as_string())
         log("  ✅ Email 寄送成功")
         return True
     except Exception as e:
