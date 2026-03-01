@@ -1,0 +1,74 @@
+name: Podcast Auto Summary
+
+on:
+  schedule:
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '強制處理最新一集'
+        type: boolean
+        default: false
+      test_notify:
+        description: '只測試通知功能'
+        type: boolean
+        default: false
+
+jobs:
+  podcast-summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install dependencies
+        run: pip install -r podcast-auto-summary/requirements.txt
+
+      - name: Restore processed episodes
+        uses: actions/cache@v4
+        with:
+          path: processed_episodes.json
+          key: processed-episodes-${{ github.run_number }}
+          restore-keys: |
+            processed-episodes-
+
+      - name: Run Podcast Monitor
+        env:
+          PODCAST_RSS_URL: ${{ secrets.PODCAST_RSS_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SUMMARY_MODEL: gpt-4o-mini
+          PODCAST_LANG: zh
+          CHECK_HOURS: '24'
+        run: |
+          if [ "${{ github.event.inputs.test_notify }}" = "true" ]; then
+            python podcast-auto-summary/podcast_monitor.py --test-notify
+          elif [ "${{ github.event.inputs.force }}" = "true" ]; then
+            python podcast-auto-summary/podcast_monitor.py --force
+          else
+            python podcast-auto-summary/podcast_monitor.py
+          fi
+
+      - name: Save processed episodes
+        if: always()
+        run: |
+          if [ -f processed_episodes.json ]; then
+            cat processed_episodes.json
+          fi
