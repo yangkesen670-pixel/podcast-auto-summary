@@ -50,6 +50,7 @@ jobs:
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SUMMARY_MODEL: gpt-4o
         run: |
           cd podcast-auto-summary
           ARGS=""
