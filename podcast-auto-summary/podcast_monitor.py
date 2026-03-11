@@ -343,7 +343,7 @@ def generate_summary(transcript, episode_title):
     # ========== 第一輪：萃取報告 ==========
     log("  📝 第一輪：萃取報告...")
     extract_response = client.messages.create(
-        model="claude-sonnet-4-6-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=8000,
         system=EXTRACT_PROMPT,
         messages=[
@@ -356,7 +356,7 @@ def generate_summary(transcript, episode_title):
     # ========== 第二輪：稽核補漏 ==========
     log("  🔍 第二輪：稽核補漏...")
     audit_response = client.messages.create(
-        model="claude-sonnet-4-6-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=4000,
         system=AUDIT_PROMPT,
         messages=[
