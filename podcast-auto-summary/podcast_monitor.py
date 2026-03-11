@@ -38,6 +38,8 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 CHECK_HOURS = int(os.environ.get("CHECK_HOURS", "24"))
 PODCAST_LANG = os.environ.get("PODCAST_LANG", "zh")
 PROCESSED_FILE = os.environ.get("PROCESSED_FILE", "processed_episodes.json")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "11DqyI8d_CyunlC7ddSAMvTkxym5TPO-5")
 
 # ============================================================
 # 股癌專屬 System Prompt — Claude Sonnet 4.6
@@ -492,6 +494,66 @@ def send_telegram(episode, summary):
 
 
 # ============================================================
+# 步驟 5c：上傳到 Google Drive
+# ============================================================
+def upload_to_gdrive(episode, summary):
+    if not GOOGLE_CREDENTIALS:
+        log("  ⚠️ Google Drive 設定不完整，跳過")
+        return False
+
+    log("正在上傳到 Google Drive...")
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaInMemoryUpload
+
+        # 解析憑證
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict, scopes=["https://www.googleapis.com/auth/drive.file"]
+        )
+        service = build("drive", "v3", credentials=creds)
+
+        # 建立檔案名稱：EP643_2026-03-11_股癌摘要.txt
+        title = episode["title"].replace("/", "-").replace("\\", "-")
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{title}_{date_str}_股癌摘要.txt"
+
+        # 組合完整內容
+        content = f"股癌 Podcast 摘要\n"
+        content += f"{'='*50}\n"
+        content += f"📻 {episode['title']}\n"
+        content += f"📅 {episode['published']}\n"
+        content += f"🔗 {episode['link']}\n"
+        content += f"{'='*50}\n\n"
+        content += summary
+        content += f"\n\n{'='*50}\n"
+        content += f"🤖 GitHub Actions + Claude Sonnet 4.6 自動生成\n"
+        content += f"⚠️ 僅為節目內容記錄，非投資建議\n"
+
+        # 上傳
+        media = MediaInMemoryUpload(
+            content.encode("utf-8"),
+            mimetype="text/plain"
+        )
+        file_metadata = {
+            "name": filename,
+            "parents": [GDRIVE_FOLDER_ID],
+        }
+        uploaded = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name"
+        ).execute()
+
+        log(f"  ✅ Google Drive 上傳成功: {uploaded['name']}")
+        return True
+    except Exception as e:
+        log(f"  ❌ Google Drive 上傳失敗: {e}")
+        return False
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def process_episode(episode):
@@ -508,6 +570,7 @@ def process_episode(episode):
 
     send_email(episode, summary)
     send_telegram(episode, summary)
+    upload_to_gdrive(episode, summary)
 
     processed = load_processed()
     processed.append(episode["id"])
