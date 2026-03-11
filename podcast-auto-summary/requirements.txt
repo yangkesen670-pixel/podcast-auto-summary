@@ -2,3 +2,5 @@ requests
 feedparser
 openai
 anthropic
+google-auth
+google-api-python-client
