@@ -507,10 +507,10 @@ def upload_to_gdrive(episode, summary):
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaInMemoryUpload
 
-        # 解析憑證
+        # 解析憑證 — 使用完整 drive scope
         creds_dict = json.loads(GOOGLE_CREDENTIALS)
         creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=["https://www.googleapis.com/auth/drive.file"]
+            creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
         )
         service = build("drive", "v3", credentials=creds)
 
@@ -531,7 +531,7 @@ def upload_to_gdrive(episode, summary):
         content += f"🤖 GitHub Actions + Claude Sonnet 4.6 自動生成\n"
         content += f"⚠️ 僅為節目內容記錄，非投資建議\n"
 
-        # 上傳
+        # 上傳到共用資料夾（服務帳號透過資料夾分享權限寫入）
         media = MediaInMemoryUpload(
             content.encode("utf-8"),
             mimetype="text/plain"
@@ -543,7 +543,8 @@ def upload_to_gdrive(episode, summary):
         uploaded = service.files().create(
             body=file_metadata,
             media_body=media,
-            fields="id, name"
+            fields="id, name",
+            supportsAllDrives=True,
         ).execute()
 
         log(f"  ✅ Google Drive 上傳成功: {uploaded['name']}")
