@@ -2,7 +2,7 @@
 """
 Podcast Auto Monitor + Transcribe + Summarize
 =============================================
-自動監控 Apple Podcast RSS → 下載音檔 → 壓縮 → Whisper 轉文字 → AI 摘要 → Email + Telegram 推送
+自動監控 Apple Podcast RSS → 下載音檔 → 壓縮 → Whisper 轉文字 → Claude 雙重稽核摘要 → Email + Telegram 推送
 """
 
 import os
@@ -20,12 +20,14 @@ from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from openai import OpenAI
+import anthropic
 
 # ============================================================
 # 設定區
 # ============================================================
 RSS_URL = os.environ.get("PODCAST_RSS_URL", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT", "")
@@ -33,71 +35,80 @@ SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "gpt-4o-mini")
 CHECK_HOURS = int(os.environ.get("CHECK_HOURS", "24"))
 PODCAST_LANG = os.environ.get("PODCAST_LANG", "zh")
 PROCESSED_FILE = os.environ.get("PROCESSED_FILE", "processed_episodes.json")
 
-SUMMARY_PROMPT = """你是一位專業的財經節目文字記錄員，負責為 Podcast 節目做詳細的內容記錄。
-這個節目是一個財經類 Podcast，主持人會分享他對市場的觀察和看法。
-節目前面通常會有廣告，請忽略廣告內容，只記錄財經相關的部分。
+# ============================================================
+# 股癌專屬 System Prompt — Claude Sonnet 4.6
+# ============================================================
+EXTRACT_PROMPT = """你是一位資深的「科技產業分析師」與「美台股全球操盤手」。
+請閱讀這份《股癌 Gooaye》的 Podcast 逐字稿，過濾掉開頭結尾的業配與生活閒聊，將核心的總經、產業鏈與個股觀點，萃取成高密度的投資報告。
 
-你的任務是忠實記錄節目內容，不是提供任何建議。請盡可能詳細。目標至少 2000 字以上。
+【擷取原則】：
+1. 挖出因果關係 (Know-Why)：不要只說「看好蘋果」，必須寫出「為什麼看好？」（例如：利用毛利優勢在記憶體漲價時搶佔市占率）。
+2. 綁定供應鏈邏輯：只要主委把「美股巨頭（如 NVDA, AAPL）」與「台股代工/零組件廠」連在一起講，必須完整保留這個上下游的推演路徑。
+3. 具體化財報與數據：將含糊的「財報不錯」，還原成逐字稿中的「具體指引、毛利率變化或市場預期的落差」。
+4. 保留主委獨特比喻：主委常使用生動的「幹話或比喻」來解釋複雜的市場心理（如：FOMO、左巴右巴），請連同上下文情境一起保留，作為心法警語。
 
-請根據逐字稿，用繁體中文產出以下記錄：
+【必須輸出的結構報告】：
 
-📌 本集主題（一句話，30字內）
+# 股癌 Gooaye｜產業與市場深度推演
 
-📊 市場觀察與總經資訊（一字不漏，全部記錄）
-把主持人提到的每一句跟市場、總經有關的話都記錄下來，逐條列出：
-- 對大盤走勢的觀察和描述
-- 提到的每一個總經數據（CPI、PPI、就業、PMI、GDP、失業率、零售等）以及他的解讀
-- 央行相關（利率、政策方向、官員發言等）
-- 匯率走勢（美元、台幣、日圓等）
-- 債券市場（殖利率變化）
-- 資金流向（外資、法人動態、融資融券）
-- 國際政經事件
-- 原物料價格走勢
-- 市場情緒的描述
-每一個點都要獨立列出，用 3-5 句話記錄主持人的完整說法。
+## 一、宏觀經濟與大盤風向 (Macro & Sentiment)
+*(記錄對美股輪動、通膨、降息預期或整體市場情緒的判斷，每個觀點都要附上主委的推演邏輯)*
 
-🏷️ 提到的所有公司 / 產業 / 基金（逐一列出，一個都不能漏）
-把逐字稿中出現的每一間公司、每一個產業、每一檔基金都列出來：
-- 名稱＋代號（台股附數字代號如 2330，美股附英文代號如 NVDA）
-- 主持人提到它時的態度（正面/負面/中性/純提及）
-- 他提到這個標的時說了什麼（完整記錄分析邏輯、數據、營收、毛利率等）
-即使只是隨口提到也要列出來標註「純提及」。
+## 二、核心產業鏈推演 (Supply Chain Logic) 🔗
+*(最重要模塊：寫出主委看好的產業趨勢，以及美股龍頭如何帶動台股概念股，必須寫出完整的邏輯故事，從上游到下游的推演路徑)*
 
-🔑 主持人的觀點與分析（逐條記錄，這是最重要的部分）
-把主持人說的每一個觀點都獨立列出來，包括：
-- 對特定產業的分析
-- 對個別公司的分析（商業模式、競爭優勢）
-- 市場走勢的判斷邏輯
-- 對新聞事件的解讀
-- 對其他人觀點的評論
-- 對一般散戶行為的觀察
-- 產業趨勢的看法
-- 任何類比、故事、歷史案例
-每個觀點用 3-5 句話完整記錄。有幾個就列幾個，絕對不要合併或省略。
+## 三、個股觀察與財報解析 (Stock Deep-Dive)
+*(用表格呈現提及的公司：包含「公司代號」、「近期動態/財報表現」、「主委觀點(看多/看空/中立)」、「關鍵支撐邏輯」)*
 
-⚠️ 主持人提到的注意事項
-- 他提醒聽眾要注意的事情
-- 他認為有疑慮的標的或現象
-- 他對市場過熱現象的描述
+| 公司代號 | 近期動態/財報表現 | 主委觀點 | 關鍵支撐邏輯 |
+|---------|----------------|---------|-----------|
 
-💡 精彩語錄（5句以上）
-- 主持人說的有記憶點的話
+## 四、交易心法與避險警告 ⚠️
+*(記錄主委對於「目前不要做什麼事」的警告，例如對槓桿、追高的看法，並附上具體情境)*
 
-📅 相關時事
-- 這集內容跟近期哪些新聞事件有關
+## 五、經典語錄與情境還原 💬
+*(列出金句，並務必在一旁補充主委說這句話時的「市場情境」，避免斷章取義)*
 
-重要：
-- 你的任務是忠實記錄節目內容，不是提供任何建議
-- 完全忽略廣告和業配內容
-- 盡量附上公司代號
-- 每一個觀點都要記錄，零遺漏
-- 輸出長度不設限，越詳細越好
-- 本記錄僅為節目內容整理"""
+【輸出要求】：
+- 用繁體中文
+- 盡可能詳細，目標 2000-4000 字
+- 每個觀點都要有因果邏輯，不要只列結論
+- 台股附數字代號（如 2330），美股附英文代號（如 NVDA）
+- 不要遺漏任何投資相關的觀點"""
+
+# ============================================================
+# 稽核 Prompt — 第二輪檢查遺漏
+# ============================================================
+AUDIT_PROMPT = """你是一位嚴格的財經內容稽核員。
+你的任務是比對「原始逐字稿」和「已萃取的報告」，找出報告中遺漏的重要資訊。
+
+請逐一檢查以下項目：
+1. 有沒有提到的公司/股票被遺漏了？（即使只是一筆帶過）
+2. 有沒有總經數據或政策事件被遺漏了？
+3. 有沒有主委的重要觀點或分析邏輯被簡化或遺漏了？
+4. 有沒有供應鏈上下游的推演被截斷了？
+5. 有沒有主委的經典比喻或幹話被遺漏了？
+6. 有沒有風險警告或避險建議被遺漏了？
+
+如果發現遺漏，請直接輸出補充內容，用以下格式：
+
+## 📋 稽核補充
+
+### 遺漏的公司/標的
+- （列出被遺漏的）
+
+### 遺漏的觀點/分析
+- （列出被遺漏的，附上完整邏輯）
+
+### 遺漏的金句/比喻
+- （列出被遺漏的，附上情境）
+
+如果沒有重大遺漏，請回覆「✅ 稽核通過，無重大遺漏」。
+用繁體中文回覆。"""
 
 
 def log(msg):
@@ -137,7 +148,6 @@ def check_new_episodes(force=False):
     log(f"找到 {len(feed.entries)} 集")
 
     if force:
-        # 強制模式：只處理最新一集
         entry = feed.entries[0]
         audio_url = None
         if hasattr(entry, "enclosures") and entry.enclosures:
@@ -158,7 +168,6 @@ def check_new_episodes(force=False):
         log("❌ 找不到音檔連結")
         return []
 
-    # 一般模式：只處理 24 小時內的新集數
     processed = load_processed()
     new_episodes = []
 
@@ -269,7 +278,7 @@ def split_audio(input_path, tmpdir, chunk_minutes=10):
 
 
 def transcribe_audio(audio_path):
-    log("正在轉錄...")
+    log("正在轉錄（Whisper）...")
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -318,31 +327,53 @@ def transcribe_audio(audio_path):
 
 
 # ============================================================
-# 步驟 4：AI 生成摘要（用更大的 token 上限）
+# 步驟 4：Claude Sonnet 4.6 雙重稽核摘要
 # ============================================================
 def generate_summary(transcript, episode_title):
-    log(f"正在生成摘要（模型: {SUMMARY_MODEL}）...")
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    log("正在生成摘要（Claude Sonnet 4.6 雙重稽核）...")
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    max_chars = 80000
+    max_chars = 100000
     if len(transcript) > max_chars:
         log(f"  ⚠️ 逐字稿 {len(transcript)} 字，截斷至 {max_chars} 字")
         head = transcript[:max_chars // 2]
         tail = transcript[-(max_chars // 2):]
         transcript = head + "\n\n[...中間部分省略...]\n\n" + tail
 
-    response = client.chat.completions.create(
-        model=SUMMARY_MODEL,
+    # ========== 第一輪：萃取報告 ==========
+    log("  📝 第一輪：萃取報告...")
+    extract_response = client.messages.create(
+        model="claude-sonnet-4-6-20250514",
+        max_tokens=8000,
+        system=EXTRACT_PROMPT,
         messages=[
-            {"role": "system", "content": SUMMARY_PROMPT},
-            {"role": "user", "content": f"節目標題：{episode_title}\n\n以下是完整逐字稿，請仔細閱讀後產出詳細摘要，不要遺漏任何投資相關的觀點：\n\n{transcript}"},
+            {"role": "user", "content": f"節目標題：{episode_title}\n\n以下是完整逐字稿，請仔細閱讀後產出詳細的結構化報告，不要遺漏任何投資相關的觀點：\n\n{transcript}"}
         ],
-        temperature=0.2,
-        max_tokens=16000,
     )
-    summary = response.choices[0].message.content
-    log(f"  ✅ 摘要生成完成: {len(summary)} 字")
-    return summary
+    report = extract_response.content[0].text
+    log(f"  ✅ 第一輪完成: {len(report)} 字")
+
+    # ========== 第二輪：稽核補漏 ==========
+    log("  🔍 第二輪：稽核補漏...")
+    audit_response = client.messages.create(
+        model="claude-sonnet-4-6-20250514",
+        max_tokens=4000,
+        system=AUDIT_PROMPT,
+        messages=[
+            {"role": "user", "content": f"【原始逐字稿】：\n{transcript}\n\n---\n\n【已萃取的報告】：\n{report}\n\n請比對以上兩者，找出報告中遺漏的重要資訊。"}
+        ],
+    )
+    audit_result = audit_response.content[0].text
+    log(f"  ✅ 第二輪完成: {len(audit_result)} 字")
+
+    # ========== 合併結果 ==========
+    if "稽核通過" in audit_result:
+        final_report = report + "\n\n---\n✅ 雙重稽核通過，無重大遺漏"
+    else:
+        final_report = report + "\n\n---\n" + audit_result
+
+    log(f"  ✅ 最終報告: {len(final_report)} 字")
+    return final_report
 
 
 # ============================================================
@@ -356,32 +387,35 @@ def send_email(episode, summary):
     log("正在寄送 Email...")
     recipients = [r.strip() for r in EMAIL_RECIPIENT.split(",")]
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🎙️ 股癌摘要：{episode['title']}"
+    msg["Subject"] = f"🎙️ 股癌深度推演：{episode['title']}"
     msg["From"] = EMAIL_SENDER
     msg["To"] = ", ".join(recipients)
 
-    text_body = f"""股癌 Podcast 摘要
-{'='*40}
+    text_body = f"""股癌 Gooaye｜產業與市場深度推演
+{'='*50}
 📻 {episode['title']}
 📅 {episode['published']}
 🔗 {episode['link']}
-{'─'*40}
+🤖 Claude Sonnet 4.6 雙重稽核萃取
+{'─'*50}
 
 {summary}
 
-{'─'*40}
-🤖 GitHub Actions 自動生成 | 僅為節目摘要，非投資建議"""
+{'─'*50}
+🤖 GitHub Actions 自動生成 | 僅為節目內容記錄，非投資建議"""
 
-    html_body = f"""<html><body style="font-family:sans-serif;max-width:650px;margin:0 auto;padding:20px;color:#333;">
-<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);padding:20px;border-radius:12px;color:white;">
-<h2 style="margin:0;">🎙️ 股癌 Podcast 摘要</h2>
-<p style="margin:8px 0 0;opacity:0.9;">{episode['title']}</p></div>
+    html_summary = summary.replace('\n', '<br>')
+    html_body = f"""<html><body style="font-family:'Microsoft JhengHei',sans-serif;max-width:700px;margin:0 auto;padding:20px;color:#333;">
+<div style="background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);padding:24px;border-radius:12px;color:white;">
+<h2 style="margin:0;">🎙️ 股癌 Gooaye｜深度推演</h2>
+<p style="margin:8px 0 0;opacity:0.9;">{episode['title']}</p>
+<p style="margin:4px 0 0;opacity:0.7;font-size:13px;">Claude Sonnet 4.6 雙重稽核萃取</p></div>
 <div style="background:#f8f9fa;padding:12px 16px;border-radius:8px;margin:20px 0;font-size:14px;">
 <p style="margin:4px 0;">📅 {episode['published']}</p>
 <p style="margin:4px 0;">🔗 <a href="{episode['link']}" style="color:#4a90d9;">收聽連結</a></p></div>
-<div style="line-height:1.9;white-space:pre-wrap;font-size:15px;">{summary}</div>
+<div style="line-height:1.9;font-size:15px;">{html_summary}</div>
 <hr style="border:none;border-top:1px solid #eee;margin:24px 0;">
-<p style="font-size:11px;color:#999;text-align:center;">🤖 GitHub Actions 自動生成 | ⚠️ 僅為節目內容摘要，非投資建議</p>
+<p style="font-size:11px;color:#999;text-align:center;">🤖 GitHub Actions + Claude Sonnet 4.6 自動生成 | ⚠️ 僅為節目內容記錄，非投資建議</p>
 </body></html>"""
 
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
@@ -409,19 +443,19 @@ def send_telegram(episode, summary):
     log("正在發送 Telegram...")
 
     header = (
-        f"🎙️ 股癌 Podcast 摘要\n\n"
+        f"🎙️ 股癌 Gooaye｜深度推演\n\n"
         f"📻 {episode['title']}\n"
         f"📅 {episode['published']}\n"
+        f"🤖 Claude Sonnet 4.6 雙重稽核\n"
         f"━━━━━━━━━━━━━━━━\n\n"
     )
     footer = (
         f"\n\n━━━━━━━━━━━━━━━━\n"
         f"🔗 {episode['link']}\n"
-        f"⚠️ 僅為節目摘要，非投資建議"
+        f"⚠️ 僅為節目內容記錄，非投資建議"
     )
 
     message = header + summary + footer
-
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
     if len(message) <= 4096:
@@ -488,12 +522,12 @@ def process_episode(episode):
 def test_notifications():
     log("🧪 測試通知功能...")
     test_episode = {
-        "title": "測試通知 - 股癌 Podcast 摘要",
+        "title": "測試通知 - 股癌深度推演系統",
         "published": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "link": "https://github.com",
         "description": "這是一則測試通知",
     }
-    test_summary = "📌 本集主題\n這是一則測試通知，確認推送功能正常。\n\n📊 市場觀點\n- 測試中\n\n🏷️ 提到的個股\n- 無（測試用）\n\n🔑 核心觀點\n1. Email 通知測試\n2. Telegram 推送測試\n\n📝 如果你收到這則通知，代表設定成功！"
+    test_summary = "# 股癌 Gooaye｜產業與市場深度推演\n\n## 一、宏觀經濟與大盤風向\n- 測試中\n\n## 二、核心產業鏈推演\n- 測試中\n\n## 三、個股觀察\n- 無（測試用）\n\n✅ 如果你收到這則通知，代表 Claude Sonnet 4.6 雙重稽核系統設定成功！"
 
     email_ok = send_email(test_episode, test_summary)
     tg_ok = send_telegram(test_episode, test_summary)
@@ -506,7 +540,7 @@ def main():
     parser.add_argument("--test-notify", action="store_true")
     args = parser.parse_args()
 
-    log("🎙️ 股癌 Podcast Auto Summary 啟動")
+    log("🎙️ 股癌深度推演系統啟動（Claude Sonnet 4.6 雙重稽核）")
 
     if args.test_notify:
         success = test_notifications()
@@ -516,7 +550,10 @@ def main():
         log("❌ 請設定 PODCAST_RSS_URL")
         sys.exit(1)
     if not OPENAI_API_KEY:
-        log("❌ 請設定 OPENAI_API_KEY")
+        log("❌ 請設定 OPENAI_API_KEY（Whisper 轉錄用）")
+        sys.exit(1)
+    if not ANTHROPIC_API_KEY:
+        log("❌ 請設定 ANTHROPIC_API_KEY（Claude 摘要用）")
         sys.exit(1)
 
     new_episodes = check_new_episodes(force=args.force)
