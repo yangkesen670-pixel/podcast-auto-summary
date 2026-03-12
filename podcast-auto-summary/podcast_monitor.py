@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Podcast Auto Monitor + Transcribe + Summarize
+股癌深度推演系統 — Claude Sonnet 4.6 雙重稽核
 =============================================
-自動監控 Apple Podcast RSS → 下載音檔 → 壓縮 → Whisper 轉文字 → Claude 雙重稽核摘要 → Email + Telegram 推送
+RSS 監控 → 下載音檔 → 壓縮 → Whisper 轉文字 → Claude 雙重稽核萃取 → Email(.txt/.md附件) + Telegram
 """
 
 import os
@@ -19,6 +19,8 @@ import feedparser
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from openai import OpenAI
 import anthropic
 
@@ -38,8 +40,6 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 CHECK_HOURS = int(os.environ.get("CHECK_HOURS", "24"))
 PODCAST_LANG = os.environ.get("PODCAST_LANG", "zh")
 PROCESSED_FILE = os.environ.get("PROCESSED_FILE", "processed_episodes.json")
-GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "11DqyI8d_CyunlC7ddSAMvTkxym5TPO-5")
 
 # ============================================================
 # 股癌專屬 System Prompt — Claude Sonnet 4.6
@@ -379,7 +379,7 @@ def generate_summary(transcript, episode_title):
 
 
 # ============================================================
-# 步驟 5a：寄 Email
+# 步驟 5a：寄 Email（含 .txt 和 .md 附件）
 # ============================================================
 def send_email(episode, summary):
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]):
@@ -388,10 +388,15 @@ def send_email(episode, summary):
 
     log("正在寄送 Email...")
     recipients = [r.strip() for r in EMAIL_RECIPIENT.split(",")]
-    msg = MIMEMultipart("alternative")
+
+    # 使用 mixed 類型才能同時有內文和附件
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = f"🎙️ 股癌深度推演：{episode['title']}"
     msg["From"] = EMAIL_SENDER
     msg["To"] = ", ".join(recipients)
+
+    # === 內文部分 ===
+    body_part = MIMEMultipart("alternative")
 
     text_body = f"""股癌 Gooaye｜產業與市場深度推演
 {'='*50}
@@ -420,14 +425,47 @@ def send_email(episode, summary):
 <p style="font-size:11px;color:#999;text-align:center;">🤖 GitHub Actions + Claude Sonnet 4.6 自動生成 | ⚠️ 僅為節目內容記錄，非投資建議</p>
 </body></html>"""
 
-    msg.attach(MIMEText(text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    body_part.attach(MIMEText(text_body, "plain", "utf-8"))
+    body_part.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(body_part)
+
+    # === 附件檔名 ===
+    title_safe = episode["title"].replace("/", "-").replace("\\", "-").replace("|", "-").replace(" ", "")
+    date_str = datetime.now().strftime("%Y-%m-%d")
+
+    # === .txt 附件 ===
+    txt_content = f"股癌 Gooaye｜產業與市場深度推演\n"
+    txt_content += f"{'='*50}\n"
+    txt_content += f"📻 {episode['title']}\n"
+    txt_content += f"📅 {episode['published']}\n"
+    txt_content += f"🔗 {episode['link']}\n"
+    txt_content += f"{'='*50}\n\n"
+    txt_content += summary
+    txt_content += f"\n\n{'='*50}\n"
+    txt_content += f"🤖 GitHub Actions + Claude Sonnet 4.6 自動生成\n"
+    txt_content += f"⚠️ 僅為節目內容記錄，非投資建議\n"
+
+    txt_attachment = MIMEBase("application", "octet-stream")
+    txt_attachment.set_payload(txt_content.encode("utf-8"))
+    encoders.encode_base64(txt_attachment)
+    txt_filename = f"{title_safe}_{date_str}_股癌摘要.txt"
+    txt_attachment.add_header("Content-Disposition", "attachment", filename=("utf-8", "", txt_filename))
+    msg.attach(txt_attachment)
+
+    # === .md 附件 ===
+    md_content = summary  # 摘要本身已經是 Markdown 格式
+    md_attachment = MIMEBase("application", "octet-stream")
+    md_attachment.set_payload(md_content.encode("utf-8"))
+    encoders.encode_base64(md_attachment)
+    md_filename = f"{title_safe}_{date_str}_股癌摘要.md"
+    md_attachment.add_header("Content-Disposition", "attachment", filename=("utf-8", "", md_filename))
+    msg.attach(md_attachment)
 
     try:
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_SENDER, recipients, msg.as_string())
-        log("  ✅ Email 寄送成功")
+        log(f"  ✅ Email 寄送成功（含 .txt 和 .md 附件）")
         return True
     except Exception as e:
         log(f"  ❌ Email 寄送失敗: {e}")
@@ -494,67 +532,6 @@ def send_telegram(episode, summary):
 
 
 # ============================================================
-# 步驟 5c：上傳到 Google Drive
-# ============================================================
-def upload_to_gdrive(episode, summary):
-    if not GOOGLE_CREDENTIALS:
-        log("  ⚠️ Google Drive 設定不完整，跳過")
-        return False
-
-    log("正在上傳到 Google Drive...")
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaInMemoryUpload
-
-        # 解析憑證 — 使用完整 drive scope
-        creds_dict = json.loads(GOOGLE_CREDENTIALS)
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        service = build("drive", "v3", credentials=creds)
-
-        # 建立檔案名稱：EP643_2026-03-11_股癌摘要.txt
-        title = episode["title"].replace("/", "-").replace("\\", "-")
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        filename = f"{title}_{date_str}_股癌摘要.txt"
-
-        # 組合完整內容
-        content = f"股癌 Podcast 摘要\n"
-        content += f"{'='*50}\n"
-        content += f"📻 {episode['title']}\n"
-        content += f"📅 {episode['published']}\n"
-        content += f"🔗 {episode['link']}\n"
-        content += f"{'='*50}\n\n"
-        content += summary
-        content += f"\n\n{'='*50}\n"
-        content += f"🤖 GitHub Actions + Claude Sonnet 4.6 自動生成\n"
-        content += f"⚠️ 僅為節目內容記錄，非投資建議\n"
-
-        # 上傳到共用資料夾（服務帳號透過資料夾分享權限寫入）
-        media = MediaInMemoryUpload(
-            content.encode("utf-8"),
-            mimetype="text/plain"
-        )
-        file_metadata = {
-            "name": filename,
-            "parents": [GDRIVE_FOLDER_ID],
-        }
-        uploaded = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, name",
-            supportsAllDrives=True,
-        ).execute()
-
-        log(f"  ✅ Google Drive 上傳成功: {uploaded['name']}")
-        return True
-    except Exception as e:
-        log(f"  ❌ Google Drive 上傳失敗: {e}")
-        return False
-
-
-# ============================================================
 # 主流程
 # ============================================================
 def process_episode(episode):
@@ -571,12 +548,11 @@ def process_episode(episode):
 
     send_email(episode, summary)
     send_telegram(episode, summary)
-    upload_to_gdrive(episode, summary)
 
     processed = load_processed()
     processed.append(episode["id"])
-    if len(processed) > 100:
-        processed = processed[-100:]
+    if len(processed) > 200:
+        processed = processed[-200:]
     save_processed(processed)
 
     log(f"✅ 集數處理完成: {episode['title']}\n")
@@ -591,7 +567,7 @@ def test_notifications():
         "link": "https://github.com",
         "description": "這是一則測試通知",
     }
-    test_summary = "# 股癌 Gooaye｜產業與市場深度推演\n\n## 一、宏觀經濟與大盤風向\n- 測試中\n\n## 二、核心產業鏈推演\n- 測試中\n\n## 三、個股觀察\n- 無（測試用）\n\n✅ 如果你收到這則通知，代表 Claude Sonnet 4.6 雙重稽核系統設定成功！"
+    test_summary = "# 股癌 Gooaye｜產業與市場深度推演\n\n## 一、宏觀經濟與大盤風向\n- 測試中\n\n## 二、核心產業鏈推演\n- 測試中\n\n## 三、個股觀察\n- 無（測試用）\n\n✅ 如果你收到這則通知（含 .txt 和 .md 附件），代表系統設定成功！"
 
     email_ok = send_email(test_episode, test_summary)
     tg_ok = send_telegram(test_episode, test_summary)
