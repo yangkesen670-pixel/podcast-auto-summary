@@ -38,15 +38,16 @@ jobs:
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
-          path: processed_episodes.json
-          key: processed-episodes
+          path: podcast-auto-summary/processed_episodes.json
+          key: processed-eps
+          restore-keys: |
+            processed-eps
 
       - name: Run Podcast Monitor
         env:
           PODCAST_RSS_URL: ${{ secrets.PODCAST_RSS_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
@@ -67,5 +68,5 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: processed_episodes.json
-          key: processed-episodes-${{ github.run_id }}
+          path: podcast-auto-summary/processed_episodes.json
+          key: processed-eps-${{ github.run_id }}
