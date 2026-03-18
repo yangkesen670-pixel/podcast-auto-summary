@@ -233,7 +233,7 @@ def compress_audio(input_path, output_path):
     log("  正在壓縮音檔...")
     cmd = [
         "ffmpeg", "-i", input_path,
-        "-b:a", "32k",
+        "-b:a", "96k",
         "-ac", "1",
         "-ar", "16000",
         "-map", "a",
@@ -249,6 +249,7 @@ def compress_audio(input_path, output_path):
 
 
 def split_audio(input_path, tmpdir, chunk_minutes=10):
+    """壓縮分段（備用）"""
     log("  正在分段...")
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -266,7 +267,7 @@ def split_audio(input_path, tmpdir, chunk_minutes=10):
         cmd = [
             "ffmpeg", "-i", input_path,
             "-ss", str(start), "-t", str(chunk_seconds),
-            "-b:a", "32k", "-ac", "1", "-ar", "16000",
+            "-b:a", "96k", "-ac", "1", "-ar", "16000",
             chunk_path, "-y"
         ]
         subprocess.run(cmd, capture_output=True, text=True)
@@ -279,24 +280,68 @@ def split_audio(input_path, tmpdir, chunk_minutes=10):
     return chunks
 
 
+def split_audio_lossless(input_path, tmpdir, chunk_minutes=8):
+    """不壓縮分段，保持原始音質（每段 8 分鐘確保 < 25MB）"""
+    log("  正在分段（保持原始品質）...")
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, text=True
+    )
+    total_duration = float(result.stdout.strip())
+    chunk_seconds = chunk_minutes * 60
+    chunks = []
+    start = 0
+    idx = 0
+
+    # 取得原始檔案副檔名
+    ext = os.path.splitext(input_path)[1] or ".mp3"
+
+    while start < total_duration:
+        chunk_path = os.path.join(tmpdir, f"chunk_{idx:03d}{ext}")
+        cmd = [
+            "ffmpeg", "-i", input_path,
+            "-ss", str(start), "-t", str(chunk_seconds),
+            "-c", "copy",  # 不重新編碼，直接複製
+            chunk_path, "-y"
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+            # 如果分段還是超過 24MB，用輕度壓縮
+            chunk_mb = os.path.getsize(chunk_path) / (1024 * 1024)
+            if chunk_mb > 24:
+                log(f"  ⚠️ 段 {idx} 仍有 {chunk_mb:.1f}MB，輕度壓縮...")
+                compressed_path = os.path.join(tmpdir, f"chunk_{idx:03d}_c.mp3")
+                cmd2 = [
+                    "ffmpeg", "-i", chunk_path,
+                    "-b:a", "128k", "-ac", "1",
+                    compressed_path, "-y"
+                ]
+                subprocess.run(cmd2, capture_output=True, text=True)
+                if os.path.exists(compressed_path):
+                    chunks.append(compressed_path)
+                else:
+                    chunks.append(chunk_path)
+            else:
+                chunks.append(chunk_path)
+        start += chunk_seconds
+        idx += 1
+
+    log(f"  ✅ 分成 {len(chunks)} 段（原始品質）")
+    return chunks
+
+
 def transcribe_audio(audio_path):
     log("正在轉錄（Whisper）...")
     client = OpenAI(api_key=OPENAI_API_KEY)
 
+    file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        compressed_path = os.path.join(tmpdir, "compressed.mp3")
-        compress_ok = compress_audio(audio_path, compressed_path)
-
-        if compress_ok:
-            work_path = compressed_path
-        else:
-            work_path = audio_path
-
-        file_size_mb = os.path.getsize(work_path) / (1024 * 1024)
-
+        # 小於 25MB：直接上傳原檔（最佳品質）
         if file_size_mb <= 24:
-            log(f"  檔案 {file_size_mb:.1f} MB，直接上傳")
-            with open(work_path, "rb") as f:
+            log(f"  檔案 {file_size_mb:.1f} MB，直接上傳（原始品質）")
+            with open(audio_path, "rb") as f:
                 transcript = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=f,
@@ -306,8 +351,9 @@ def transcribe_audio(audio_path):
             log(f"  ✅ 轉錄完成: {len(transcript)} 字")
             return transcript
 
-        log(f"  檔案 {file_size_mb:.1f} MB，需要分段處理")
-        chunks = split_audio(work_path, tmpdir)
+        # 大於 25MB：分段但不壓縮，保持原始品質
+        log(f"  檔案 {file_size_mb:.1f} MB，分段處理（保持原始品質）")
+        chunks = split_audio_lossless(audio_path, tmpdir)
         full_transcript = []
 
         for i, chunk_path in enumerate(chunks):
@@ -326,6 +372,30 @@ def transcribe_audio(audio_path):
         transcript = "\n\n".join(full_transcript)
         log(f"  ✅ 分段轉錄完成: {len(transcript)} 字")
         return transcript
+
+
+def check_transcript_quality(transcript):
+    """檢查逐字稿是否有 Whisper 幻覺（大量重複文字）"""
+    if len(transcript) < 500:
+        log("  ⚠️ 逐字稿太短，可能轉錄失敗")
+        return False
+
+    # 把逐字稿切成 50 字一段，檢查重複率
+    chunk_size = 50
+    chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
+    if len(chunks) < 10:
+        return True
+
+    from collections import Counter
+    counter = Counter(chunks)
+    most_common_count = counter.most_common(1)[0][1]
+    repeat_ratio = most_common_count / len(chunks)
+
+    if repeat_ratio > 0.3:
+        log(f"  ⚠️ 偵測到 Whisper 幻覺！重複率 {repeat_ratio:.0%}，逐字稿品質不佳")
+        return False
+
+    return True
 
 
 # ============================================================
@@ -544,6 +614,13 @@ def process_episode(episode):
         audio_path = os.path.join(tmpdir, f"episode{audio_ext}")
         download_audio(episode["audio_url"], audio_path)
         transcript = transcribe_audio(audio_path)
+
+        # 檢查逐字稿品質，避免 Whisper 幻覺浪費 Claude API 費用
+        if not check_transcript_quality(transcript):
+            log("  ⚠️ 逐字稿品質不佳，跳過本集（不發送、不扣費）")
+            log("  💡 可能原因：音檔壓縮品質不足或 Whisper 產生幻覺文字")
+            return None
+
         summary = generate_summary(transcript, episode["title"])
 
     send_email(episode, summary)
