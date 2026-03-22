@@ -2,7 +2,11 @@ name: Podcast Auto Summary
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'
+    # 針對股癌發布時間進行密集打擊 (UTC 時間，台灣時間早上 08:30 與 09:00)
+    - cron: '30 0 * * *'
+    - cron: '0 1 * * *'
+    # 預留一個晚間排程防漏 (台灣時間晚上 20:00)
+    - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -14,14 +18,23 @@ on:
         type: boolean
         default: false
 
+# 限制併發，避免多個 Runner 同時修改檔案產生 Git 衝突
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   podcast-summary:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write  # 必須開啟 Repository 的寫入權限才能 Auto-Commit
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Auto-Commit 需要完整的 Git 歷史紀錄
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,15 +46,6 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r podcast-auto-summary/requirements.txt
-
-      - name: Restore processed episodes
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: podcast-auto-summary/processed_episodes.json
-          key: processed-eps
-          restore-keys: |
-            processed-eps
 
       - name: Run Podcast Monitor
         env:
@@ -60,13 +64,12 @@ jobs:
             ARGS="--force"
           fi
           if [ "${{ github.event.inputs.test_notify }}" = "true" ]; then
-            ARGS="--test-notify"
+            ARGS="$ARGS --test-notify" # 修正變數覆蓋漏洞
           fi
           python podcast_monitor.py $ARGS
 
-      - name: Save processed episodes
-        if: always()
-        uses: actions/cache/save@v4
+      - name: Commit processed episodes
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          path: podcast-auto-summary/processed_episodes.json
-          key: processed-eps-${{ github.run_id }}
+          commit_message: "chore: auto-update processed_episodes.json [skip ci]"
+          file_pattern: podcast-auto-summary/processed_episodes.json
