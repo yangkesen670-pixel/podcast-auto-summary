@@ -2,7 +2,7 @@
 """
 股癌深度推演系統 — Claude Sonnet 4.6 雙重稽核
 =============================================
-RSS 監控 → 下載音檔 → 壓縮 → Whisper 轉文字 → Claude 雙重稽核萃取 → Email(.txt/.md附件) + Telegram
+RSS 監控 → 下載音檔 → Whisper 轉文字 → Claude 雙重稽核萃取 → Email(.txt/.md附件) + Telegram
 """
 
 import os
@@ -15,6 +15,7 @@ import argparse
 import tempfile
 import subprocess
 import requests
+import re
 import feedparser
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
@@ -42,7 +43,7 @@ PODCAST_LANG = os.environ.get("PODCAST_LANG", "zh")
 PROCESSED_FILE = os.environ.get("PROCESSED_FILE", "processed_episodes.json")
 
 # ============================================================
-# 股癌專屬 System Prompt — Claude Sonnet 4.6
+# 股癌專屬 System Prompt — Claude Sonnet 4.6（EP643 深度格式 + 數字鐵律）
 # ============================================================
 EXTRACT_PROMPT = """你是一位資深的「科技產業分析師」與「美台股全球操盤手」。
 請閱讀這份《股癌 Gooaye》的 Podcast 逐字稿，過濾掉開頭結尾的業配與生活閒聊，將核心的總經、產業鏈與個股觀點，萃取成高密度的投資報告。
@@ -52,6 +53,7 @@ EXTRACT_PROMPT = """你是一位資深的「科技產業分析師」與「美台
 2. 綁定供應鏈邏輯：只要主委把「美股巨頭（如 NVDA, AAPL）」與「台股代工/零組件廠」連在一起講，必須完整保留這個上下游的推演路徑。
 3. 具體化財報與數據：將含糊的「財報不錯」，還原成逐字稿中的「具體指引、毛利率變化或市場預期的落差」。
 4. 保留主委獨特比喻：主委常使用生動的「幹話或比喻」來解釋複雜的市場心理（如：FOMO、左巴右巴），請連同上下文情境一起保留，作為心法警語。
+5. 【鐵律】絕對不可省略任何具體數字（如：15-20%現金、VIX 40、4倍槓桿、毛利率70%+、漲幅50%、下滑10-20%）、點位、百分比、倍數，以及特殊公司代號（如 GROK、Alchip）。數字是操作的靈魂，省略數字等於廢話。
 
 【必須輸出的結構報告】：
 
@@ -70,7 +72,7 @@ EXTRACT_PROMPT = """你是一位資深的「科技產業分析師」與「美台
 |---------|----------------|---------|-----------|
 
 ## 四、交易心法與避險警告 ⚠️
-*(記錄主委對於「目前不要做什麼事」的警告，例如對槓桿、追高的看法，並附上具體情境)*
+*(記錄主委對於「目前不要做什麼事」的警告，例如對槓桿、追高的看法，並附上具體情境與數字)*
 
 ## 五、經典語錄與情境還原 💬
 *(列出金句，並務必在一旁補充主委說這句話時的「市場情境」，避免斷章取義)*
@@ -80,36 +82,19 @@ EXTRACT_PROMPT = """你是一位資深的「科技產業分析師」與「美台
 - 盡可能詳細，目標 2000-4000 字
 - 每個觀點都要有因果邏輯，不要只列結論
 - 台股附數字代號（如 2330），美股附英文代號（如 NVDA）
-- 不要遺漏任何投資相關的觀點"""
+- 不要遺漏任何投資相關的觀點
+- 所有具體數字必須完整保留，不可用模糊詞彙取代"""
 
 # ============================================================
-# 稽核 Prompt — 第二輪檢查遺漏
+# 稽核 Prompt — 第二輪：揉合補漏（不是列清單）
 # ============================================================
 AUDIT_PROMPT = """你是一位嚴格的財經內容稽核員。
-你的任務是比對「原始逐字稿」和「已萃取的報告」，找出報告中遺漏的重要資訊。
+請比對「原始逐字稿」和「第一輪萃取報告」，找出報告中遺漏的重要資訊（例如：隱藏的公司代號、產業心理博弈細節、市場分歧觀點、生動的幹話比喻、具體數字如百分比/點位/倍數）。
 
-請逐一檢查以下項目：
-1. 有沒有提到的公司/股票被遺漏了？（即使只是一筆帶過）
-2. 有沒有總經數據或政策事件被遺漏了？
-3. 有沒有主委的重要觀點或分析邏輯被簡化或遺漏了？
-4. 有沒有供應鏈上下游的推演被截斷了？
-5. 有沒有主委的經典比喻或幹話被遺漏了？
-6. 有沒有風險警告或避險建議被遺漏了？
-
-如果發現遺漏，請直接輸出補充內容，用以下格式：
-
-## 📋 稽核補充
-
-### 遺漏的公司/標的
-- （列出被遺漏的）
-
-### 遺漏的觀點/分析
-- （列出被遺漏的，附上完整邏輯）
-
-### 遺漏的金句/比喻
-- （列出被遺漏的，附上情境）
-
-如果沒有重大遺漏，請回覆「✅ 稽核通過，無重大遺漏」。
+【任務要求】：
+不要列出補充清單！請直接將你發現漏掉的資訊，「原地無縫揉合」進原本的第一輪報告中對應的段落。
+請輸出「經過補漏後的完整最終版報告」，維持第一輪報告的標題架構與表格格式。
+如果沒有發現重大遺漏，也請直接輸出原本的第一輪報告。
 用繁體中文回覆。"""
 
 
@@ -227,59 +212,8 @@ def download_audio(audio_url, output_path):
 
 
 # ============================================================
-# 步驟 3：壓縮 + 分段 + Whisper 轉錄
+# 步驟 3：分段 + Whisper 轉錄（不壓縮，保持原始品質）
 # ============================================================
-def compress_audio(input_path, output_path):
-    log("  正在壓縮音檔...")
-    cmd = [
-        "ffmpeg", "-i", input_path,
-        "-b:a", "96k",
-        "-ac", "1",
-        "-ar", "16000",
-        "-map", "a",
-        output_path, "-y"
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if os.path.exists(output_path):
-        new_size = os.path.getsize(output_path) / (1024 * 1024)
-        log(f"  ✅ 壓縮完成: {new_size:.1f} MB")
-        return True
-    log(f"  ❌ 壓縮失敗: {result.stderr[:200]}")
-    return False
-
-
-def split_audio(input_path, tmpdir, chunk_minutes=10):
-    """壓縮分段（備用）"""
-    log("  正在分段...")
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-        capture_output=True, text=True
-    )
-    total_duration = float(result.stdout.strip())
-    chunk_seconds = chunk_minutes * 60
-    chunks = []
-    start = 0
-    idx = 0
-
-    while start < total_duration:
-        chunk_path = os.path.join(tmpdir, f"chunk_{idx:03d}.mp3")
-        cmd = [
-            "ffmpeg", "-i", input_path,
-            "-ss", str(start), "-t", str(chunk_seconds),
-            "-b:a", "96k", "-ac", "1", "-ar", "16000",
-            chunk_path, "-y"
-        ]
-        subprocess.run(cmd, capture_output=True, text=True)
-        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
-            chunks.append(chunk_path)
-        start += chunk_seconds
-        idx += 1
-
-    log(f"  ✅ 分成 {len(chunks)} 段")
-    return chunks
-
-
 def split_audio_lossless(input_path, tmpdir, chunk_minutes=8):
     """不壓縮分段，保持原始音質（每段 8 分鐘確保 < 25MB）"""
     log("  正在分段（保持原始品質）...")
@@ -293,8 +227,6 @@ def split_audio_lossless(input_path, tmpdir, chunk_minutes=8):
     chunks = []
     start = 0
     idx = 0
-
-    # 取得原始檔案副檔名
     ext = os.path.splitext(input_path)[1] or ".mp3"
 
     while start < total_duration:
@@ -302,12 +234,11 @@ def split_audio_lossless(input_path, tmpdir, chunk_minutes=8):
         cmd = [
             "ffmpeg", "-i", input_path,
             "-ss", str(start), "-t", str(chunk_seconds),
-            "-c", "copy",  # 不重新編碼，直接複製
+            "-c", "copy",
             chunk_path, "-y"
         ]
         subprocess.run(cmd, capture_output=True, text=True)
         if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
-            # 如果分段還是超過 24MB，用輕度壓縮
             chunk_mb = os.path.getsize(chunk_path) / (1024 * 1024)
             if chunk_mb > 24:
                 log(f"  ⚠️ 段 {idx} 仍有 {chunk_mb:.1f}MB，輕度壓縮...")
@@ -334,11 +265,9 @@ def split_audio_lossless(input_path, tmpdir, chunk_minutes=8):
 def transcribe_audio(audio_path):
     log("正在轉錄（Whisper）...")
     client = OpenAI(api_key=OPENAI_API_KEY)
-
     file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 小於 25MB：直接上傳原檔（最佳品質）
         if file_size_mb <= 24:
             log(f"  檔案 {file_size_mb:.1f} MB，直接上傳（原始品質）")
             with open(audio_path, "rb") as f:
@@ -351,7 +280,6 @@ def transcribe_audio(audio_path):
             log(f"  ✅ 轉錄完成: {len(transcript)} 字")
             return transcript
 
-        # 大於 25MB：分段但不壓縮，保持原始品質
         log(f"  檔案 {file_size_mb:.1f} MB，分段處理（保持原始品質）")
         chunks = split_audio_lossless(audio_path, tmpdir)
         full_transcript = []
@@ -380,26 +308,24 @@ def check_transcript_quality(transcript):
         log("  ⚠️ 逐字稿太短，可能轉錄失敗")
         return False
 
-    # 把逐字稿切成 50 字一段，檢查重複率
     chunk_size = 50
-    chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
-    if len(chunks) < 10:
+    text_chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
+    if len(text_chunks) < 10:
         return True
 
     from collections import Counter
-    counter = Counter(chunks)
+    counter = Counter(text_chunks)
     most_common_count = counter.most_common(1)[0][1]
-    repeat_ratio = most_common_count / len(chunks)
+    repeat_ratio = most_common_count / len(text_chunks)
 
     if repeat_ratio > 0.3:
         log(f"  ⚠️ 偵測到 Whisper 幻覺！重複率 {repeat_ratio:.0%}，逐字稿品質不佳")
         return False
-
     return True
 
 
 # ============================================================
-# 步驟 4：Claude Sonnet 4.6 雙重稽核摘要
+# 步驟 4：Claude Sonnet 4.6 雙重稽核摘要（揉合式）
 # ============================================================
 def generate_summary(transcript, episode_title):
     log("正在生成摘要（Claude Sonnet 4.6 雙重稽核）...")
@@ -425,26 +351,18 @@ def generate_summary(transcript, episode_title):
     report = extract_response.content[0].text
     log(f"  ✅ 第一輪完成: {len(report)} 字")
 
-    # ========== 第二輪：稽核補漏 ==========
-    log("  🔍 第二輪：稽核補漏...")
+    # ========== 第二輪：揉合補漏（直接輸出完整最終版）==========
+    log("  🔍 第二輪：稽核揉合...")
     audit_response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4000,
+        max_tokens=10000,
         system=AUDIT_PROMPT,
         messages=[
-            {"role": "user", "content": f"【原始逐字稿】：\n{transcript}\n\n---\n\n【已萃取的報告】：\n{report}\n\n請比對以上兩者，找出報告中遺漏的重要資訊。"}
+            {"role": "user", "content": f"【原始逐字稿】：\n{transcript}\n\n---\n\n【第一輪萃取報告】：\n{report}\n\n請比對以上兩者，將遺漏的資訊原地揉合進報告中，輸出完整的最終版。"}
         ],
     )
-    audit_result = audit_response.content[0].text
-    log(f"  ✅ 第二輪完成: {len(audit_result)} 字")
-
-    # ========== 合併結果 ==========
-    if "稽核通過" in audit_result:
-        final_report = report + "\n\n---\n✅ 雙重稽核通過，無重大遺漏"
-    else:
-        final_report = report + "\n\n---\n" + audit_result
-
-    log(f"  ✅ 最終報告: {len(final_report)} 字")
+    final_report = audit_response.content[0].text
+    log(f"  ✅ 最終報告（揉合版）: {len(final_report)} 字")
     return final_report
 
 
@@ -459,13 +377,12 @@ def send_email(episode, summary):
     log("正在寄送 Email...")
     recipients = [r.strip() for r in EMAIL_RECIPIENT.split(",")]
 
-    # 使用 mixed 類型才能同時有內文和附件
     msg = MIMEMultipart("mixed")
     msg["Subject"] = f"🎙️ 股癌深度推演：{episode['title']}"
     msg["From"] = EMAIL_SENDER
     msg["To"] = ", ".join(recipients)
 
-    # === 內文部分 ===
+    # === 內文 ===
     body_part = MIMEMultipart("alternative")
 
     text_body = f"""股癌 Gooaye｜產業與市場深度推演
@@ -499,36 +416,23 @@ def send_email(episode, summary):
     body_part.attach(MIMEText(html_body, "html", "utf-8"))
     msg.attach(body_part)
 
-    # === 附件檔名 ===
+    # === 附件 ===
     title_safe = episode["title"].replace("/", "-").replace("\\", "-").replace("|", "-").replace(" ", "")
     date_str = datetime.now().strftime("%Y-%m-%d")
 
-    # === .txt 附件 ===
-    txt_content = f"股癌 Gooaye｜產業與市場深度推演\n"
-    txt_content += f"{'='*50}\n"
-    txt_content += f"📻 {episode['title']}\n"
-    txt_content += f"📅 {episode['published']}\n"
-    txt_content += f"🔗 {episode['link']}\n"
-    txt_content += f"{'='*50}\n\n"
-    txt_content += summary
-    txt_content += f"\n\n{'='*50}\n"
-    txt_content += f"🤖 GitHub Actions + Claude Sonnet 4.6 自動生成\n"
-    txt_content += f"⚠️ 僅為節目內容記錄，非投資建議\n"
-
+    # .txt 附件
+    txt_content = f"股癌 Gooaye｜產業與市場深度推演\n{'='*50}\n📻 {episode['title']}\n📅 {episode['published']}\n🔗 {episode['link']}\n{'='*50}\n\n{summary}\n\n{'='*50}\n🤖 GitHub Actions + Claude Sonnet 4.6 自動生成\n⚠️ 僅為節目內容記錄，非投資建議\n"
     txt_attachment = MIMEBase("application", "octet-stream")
     txt_attachment.set_payload(txt_content.encode("utf-8"))
     encoders.encode_base64(txt_attachment)
-    txt_filename = f"{title_safe}_{date_str}_股癌摘要.txt"
-    txt_attachment.add_header("Content-Disposition", "attachment", filename=("utf-8", "", txt_filename))
+    txt_attachment.add_header("Content-Disposition", "attachment", filename=("utf-8", "", f"{title_safe}_{date_str}_股癌摘要.txt"))
     msg.attach(txt_attachment)
 
-    # === .md 附件 ===
-    md_content = summary  # 摘要本身已經是 Markdown 格式
+    # .md 附件
     md_attachment = MIMEBase("application", "octet-stream")
-    md_attachment.set_payload(md_content.encode("utf-8"))
+    md_attachment.set_payload(summary.encode("utf-8"))
     encoders.encode_base64(md_attachment)
-    md_filename = f"{title_safe}_{date_str}_股癌摘要.md"
-    md_attachment.add_header("Content-Disposition", "attachment", filename=("utf-8", "", md_filename))
+    md_attachment.add_header("Content-Disposition", "attachment", filename=("utf-8", "", f"{title_safe}_{date_str}_股癌摘要.md"))
     msg.attach(md_attachment)
 
     try:
@@ -543,7 +447,7 @@ def send_email(episode, summary):
 
 
 # ============================================================
-# 步驟 5b：發送 Telegram
+# 步驟 5b：發送 Telegram（HTML 安全解析 + 智慧分段 + 致命錯誤阻斷）
 # ============================================================
 def send_telegram(episode, summary):
     if not all([TG_BOT_TOKEN, TG_CHAT_ID]):
@@ -552,8 +456,19 @@ def send_telegram(episode, summary):
 
     log("正在發送 Telegram...")
 
+    def format_telegram_html(text):
+        """將 Markdown 轉為 Telegram 安全的 HTML"""
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = re.sub(r'^#+ (.*?)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+        text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+        table_pattern = re.compile(r'(^\|.*\|(?: *\r?\n\|.*\|)*)', re.MULTILINE)
+        text = table_pattern.sub(r'<pre>\1</pre>', text)
+        return text
+
+    html_summary = format_telegram_html(summary)
+
     header = (
-        f"🎙️ 股癌 Gooaye｜深度推演\n\n"
+        f"<b>🎙️ 股癌 Gooaye｜深度推演</b>\n\n"
         f"📻 {episode['title']}\n"
         f"📅 {episode['published']}\n"
         f"🤖 Claude Sonnet 4.6 雙重稽核\n"
@@ -561,44 +476,79 @@ def send_telegram(episode, summary):
     )
     footer = (
         f"\n\n━━━━━━━━━━━━━━━━\n"
-        f"🔗 {episode['link']}\n"
+        f"🔗 <a href='{episode['link']}'>收聽連結</a>\n"
         f"⚠️ 僅為節目內容記錄，非投資建議"
     )
 
-    message = header + summary + footer
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
-    if len(message) <= 4096:
+    # 按段落分割，確保表格和標題不被腰斬
+    paragraphs = html_summary.split('\n\n')
+    chunks = []
+    current_chunk = header
+
+    for p in paragraphs:
+        if len(p) > 3800:
+            sub_parts = [p[i:i+3800] for i in range(0, len(p), 3800)]
+            for sp in sub_parts:
+                if len(current_chunk) + len(sp) + 2 <= 4000:
+                    current_chunk += sp + "\n\n"
+                else:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = sp + "\n\n"
+            continue
+
+        if len(current_chunk) + len(p) + 2 <= 4000:
+            current_chunk += p + "\n\n"
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = p + "\n\n"
+
+    current_chunk += footer
+    if len(current_chunk) > 4000:
+        current_chunk = current_chunk.replace(footer, "").strip()
+        chunks.append(current_chunk)
+        chunks.append(footer.strip())
+    else:
+        chunks.append(current_chunk.strip())
+
+    success = True
+    for chunk in chunks:
         payload = {
             "chat_id": TG_CHAT_ID,
-            "text": message,
+            "text": chunk,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         try:
             resp = requests.post(url, json=payload, timeout=30)
-            if resp.status_code == 200:
-                log("  ✅ Telegram 發送成功")
-                return True
-            else:
-                log(f"  ❌ Telegram 發送失敗: {resp.status_code}")
-                return False
+            if resp.status_code != 200:
+                # 攔截 401 或 404 等致命錯誤，直接中斷不再重試
+                if resp.status_code in [401, 404]:
+                    log(f"  ❌ Telegram 致命錯誤 ({resp.status_code})：Token 或 Chat ID 無效，中止後續段落發送。")
+                    success = False
+                    break
+                # 若為 400 語法錯誤，才觸發純文字降級
+                elif resp.status_code == 400:
+                    log(f"  ⚠️ HTML 模式失敗 (400)，降級純文字重送...")
+                    plain = re.sub(r'<[^>]+>', '', chunk)
+                    payload_fb = {"chat_id": TG_CHAT_ID, "text": plain, "disable_web_page_preview": True}
+                    resp2 = requests.post(url, json=payload_fb, timeout=30)
+                    if resp2.status_code != 200:
+                        log(f"  ❌ Telegram 降級發送依然失敗: {resp2.status_code}")
+                        success = False
+                else:
+                    log(f"  ❌ Telegram 發送失敗: {resp.status_code}")
+                    success = False
         except Exception as e:
-            log(f"  ❌ Telegram 發送失敗: {e}")
-            return False
-    else:
-        log("  摘要較長，分段發送 Telegram...")
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": header.strip(), "disable_web_page_preview": True}, timeout=30)
-        time.sleep(0.5)
+            log(f"  ❌ Telegram 發送發生異常: {e}，中止後續段落發送。")
+            success = False
+            break  # 網路斷線等嚴重異常，直接中斷
+        time.sleep(1)
 
-        chunk_size = 4000
-        for i in range(0, len(summary), chunk_size):
-            chunk = summary[i:i+chunk_size]
-            requests.post(url, json={"chat_id": TG_CHAT_ID, "text": chunk, "disable_web_page_preview": True}, timeout=30)
-            time.sleep(0.5)
-
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": footer.strip(), "disable_web_page_preview": True}, timeout=30)
-        log("  ✅ Telegram 分段發送成功")
-        return True
+    if success:
+        log("  ✅ Telegram 發送成功")
+    return success
 
 
 # ============================================================
@@ -615,10 +565,9 @@ def process_episode(episode):
         download_audio(episode["audio_url"], audio_path)
         transcript = transcribe_audio(audio_path)
 
-        # 檢查逐字稿品質，避免 Whisper 幻覺浪費 Claude API 費用
         if not check_transcript_quality(transcript):
             log("  ⚠️ 逐字稿品質不佳，跳過本集（不發送、不扣費）")
-            log("  💡 可能原因：音檔壓縮品質不足或 Whisper 產生幻覺文字")
+            log("  💡 可能原因：Whisper 產生幻覺文字")
             return None
 
         summary = generate_summary(transcript, episode["title"])
@@ -644,7 +593,34 @@ def test_notifications():
         "link": "https://github.com",
         "description": "這是一則測試通知",
     }
-    test_summary = "# 股癌 Gooaye｜產業與市場深度推演\n\n## 一、宏觀經濟與大盤風向\n- 測試中\n\n## 二、核心產業鏈推演\n- 測試中\n\n## 三、個股觀察\n- 無（測試用）\n\n✅ 如果你收到這則通知（含 .txt 和 .md 附件），代表系統設定成功！"
+    test_summary = """# 股癌 Gooaye｜產業與市場深度推演
+
+## 一、宏觀經濟與大盤風向 (Macro & Sentiment)
+
+### 1. 測試項目：VIX 波動率操作邏輯
+- VIX > 40 時，事後回頭看幾乎都是好買點
+- 現金水位維持 15-20%
+
+## 二、核心產業鏈推演 (Supply Chain Logic) 🔗
+- LPU V4 有機會在台積電 (2330) N3 製程 + CoWoS-R 封裝生產
+
+## 三、個股觀察與財報解析 (Stock Deep-Dive)
+
+| 公司代號 | 近期動態/財報表現 | 主委觀點 | 關鍵支撐邏輯 |
+|---------|----------------|---------|-----------|
+| NVDA | GTC 大會在即 | ✅ 看多 | 4x P/E 相對低位 |
+| 2330 | LPU V4 代工傳聞 | ✅ 看多 | 從三星搶單 |
+| MU | 毛利率突破 70%+ | ✅ 看多 | 記憶體漲價週期 |
+
+## 四、交易心法與避險警告 ⚠️
+- 拒絕任何形式的槓桿操作
+- 以 3月2日 股價作為強弱分水嶺
+
+## 五、經典語錄與情境還原 💬
+- 「捏住你的軟蛋去買。」 (情境：VIX 突破 40 恐慌極點時)
+- 「梁靜茹給的勇氣少掉一半。」 (情境：伊朗新領袖消息打亂抄底計畫)
+
+✅ 如果你收到這則通知（含 .txt 和 .md 附件），代表系統設定成功！"""
 
     email_ok = send_email(test_episode, test_summary)
     tg_ok = send_telegram(test_episode, test_summary)
