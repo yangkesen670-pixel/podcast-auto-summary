@@ -2,7 +2,7 @@ name: Podcast Auto Summary
 
 on:
   schedule:
-    # 針對股癌發布時間進行密集打擊 (UTC 時間，台灣時間早上 08:30 與 09:00)
+    # 針對股癌發布時間進行密集打擊 (UTC 時間，台灣早上 08:30 與 09:00)
     - cron: '30 0 * * *'
     - cron: '0 1 * * *'
     # 預留一個晚間排程防漏 (台灣時間晚上 20:00)
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: write  # 必須開啟 Repository 的寫入權限才能 Auto-Commit
+      contents: write  # 必須開啟 Repository 寫入權限才能 Auto-Commit
 
     steps:
       - name: Checkout code
@@ -64,7 +64,7 @@ jobs:
             ARGS="--force"
           fi
           if [ "${{ github.event.inputs.test_notify }}" = "true" ]; then
-            ARGS="$ARGS --test-notify" # 修正變數覆蓋漏洞
+            ARGS="$ARGS --test-notify"
           fi
           python podcast_monitor.py $ARGS
 
@@ -73,3 +73,13 @@ jobs:
         with:
           commit_message: "chore: auto-update processed_episodes.json [skip ci]"
           file_pattern: podcast-auto-summary/processed_episodes.json
+
+      - name: Send Telegram Alert on Infrastructure Failure
+        if: failure()  # 只要前面的任何一個步驟 Crash 就會觸發
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          curl -s -X POST https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage \
+            -d chat_id=$TG_CHAT_ID \
+            -d text="🚨 [GitHub Actions 警報] 股癌深度推演系統崩潰！%0A基礎設施或環境配置發生錯誤，請立刻登入 GitHub 檢查 Log。"
