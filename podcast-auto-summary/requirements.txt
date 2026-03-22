@@ -1,4 +1,4 @@
-requests
-feedparser
-openai
-anthropic
+requests>=2.31.0
+feedparser>=6.0.10
+openai>=1.14.0
+anthropic>=0.20.0
